@@ -20,7 +20,7 @@
 //! let mut sticks = Sticks::disarmed();
 //! loop {
 //!     let telemetry = handset.poll(&sticks.to_crsf())?;
-//!     if let Some(link) = telemetry.link {
+//!     if let Some(link) = telemetry.link.filter(|_| telemetry.link_is_fresh(Duration::from_secs(2))) {
 //!         println!("{}% uplink", link.uplink_lq);
 //!     }
 //!     sticks.yaw = 0.2;

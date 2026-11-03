@@ -123,6 +123,10 @@ pub fn pack_channels(channels: &[u16; CHANNEL_COUNT]) -> [u8; 22] {
 }
 
 /// Unpack 16 channels from a 22-byte CRSF payload.
+///
+/// This low-level helper pads missing bytes with zero and ignores trailing bytes
+/// (for example, an extended RC frame's status byte). Validate the length before
+/// using untrusted data; [`RawFrame::decode`] requires at least 22 bytes.
 #[must_use]
 pub fn unpack_channels(payload: &[u8]) -> [u16; CHANNEL_COUNT] {
     let mut channels = [0u16; CHANNEL_COUNT];

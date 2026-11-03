@@ -210,14 +210,15 @@ export function Desk() {
           hadGamepad = false;
           cleanupRef.current();
         }
-        if (pad.buttons[1]?.pressed) {
-          if (holdRaf.current !== null) cancelAnimationFrame(holdRaf.current);
-          holdRaf.current = null;
-          setHold(0);
-          armedRef.current = false;
-          outputsRef.current = buildOutputs(sticksRef.current, switchesRef.current, false, invertsRef.current);
-          setArmed(false);
-        }
+      }
+      // Disarm remains available while an on-screen stick owns the axes.
+      if (pad?.buttons[1]?.pressed) {
+        if (holdRaf.current !== null) cancelAnimationFrame(holdRaf.current);
+        holdRaf.current = null;
+        setHold(0);
+        armedRef.current = false;
+        outputsRef.current = buildOutputs(sticksRef.current, switchesRef.current, false, invertsRef.current);
+        setArmed(false);
       }
       frame = requestAnimationFrame(tick);
     };
