@@ -40,11 +40,13 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 export function axisUs(value: number, invert: boolean): number {
+  if (!Number.isFinite(value)) return US_MID;
   const signed = invert ? -value : value;
   return Math.round(US_MID + clamp(signed, -1, 1) * (US_MAX - US_MID));
 }
 
 export function throttleUs(value: number, invert: boolean): number {
+  if (!Number.isFinite(value)) return US_MIN;
   const travel = invert ? 1 - value : value;
   return Math.round(US_MIN + clamp(travel, 0, 1) * (US_MAX - US_MIN));
 }
@@ -85,7 +87,8 @@ function deadzone(value: number): number {
 
 /** Mode 2 from a standard gamepad. Left stick Y rests at half throttle. */
 export function sticksFromGamepad(gamepad: Gamepad): Sticks | null {
-  if (!gamepad.connected || gamepad.axes.length < 4) return null;
+  if (!gamepad.connected || gamepad.axes.length < 4 ||
+      gamepad.axes.slice(0, 4).some((axis) => !Number.isFinite(axis))) return null;
   const leftX = deadzone(gamepad.axes[0] ?? 0);
   const leftY = deadzone(gamepad.axes[1] ?? 0);
   const rightX = deadzone(gamepad.axes[2] ?? 0);
@@ -96,4 +99,17 @@ export function sticksFromGamepad(gamepad: Gamepad): Sticks | null {
     roll: clamp(rightX, -1, 1),
     pitch: clamp(-rightY, -1, 1),
   };
+}
+
+/** Neutral axes and low output throttle, including when throttle is reversed. */
+export function safeSticks(inverts: Inverts): Sticks {
+  return { roll: 0, pitch: 0, yaw: 0, throttle: inverts.throttle ? 1 : 0 };
+}
+
+/** Force low throttle/arm while retaining the caller's auxiliary channels. */
+export function safeChannels(channels: readonly number[]): number[] {
+  const safe = [...channels];
+  safe[2] = usToCrsf(US_MIN);
+  safe[4] = usToCrsf(US_MIN);
+  return safe;
 }

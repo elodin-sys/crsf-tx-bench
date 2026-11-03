@@ -25,9 +25,10 @@ export const US_MIN = 988;
 export const US_MID = 1500;
 export const US_MAX = 2012;
 
-/** Baud rates the ExpressLRS handset UART will lock to. 400000 is the usual one. */
+/** Supported USB handset rates, a subset of ExpressLRS's UART search list. */
 export const HANDSET_BAUDS = [115200, 400000, 921600, 1870000, 2250000] as const;
-export const DEFAULT_BAUD = 400000;
+/** Verified with the Nomad's CP2102 USB bridge on macOS. */
+export const DEFAULT_BAUD = 115200;
 
 const TX_POWER_MW = [0, 10, 25, 100, 500, 1000, 2000, 250, 50] as const;
 
@@ -45,6 +46,7 @@ export function crc8(data: Uint8Array, poly = 0xd5): number {
 
 /** Map a stick microsecond value into an 11-bit CRSF channel. */
 export function usToCrsf(us: number): number {
+  if (!Number.isFinite(us)) throw new RangeError("Channel value must be finite");
   const clamped = Math.min(US_MAX, Math.max(US_MIN, us));
   const pulses = Math.round((clamped - US_MID) * 2);
   const value = CRSF_CHANNEL_MID + Math.trunc((pulses * 4) / 5);
@@ -52,6 +54,7 @@ export function usToCrsf(us: number): number {
 }
 
 export function crsfToUs(value: number): number {
+  requireChannel(value);
   const pulses = Math.round(((value - CRSF_CHANNEL_MID) * 5) / 4);
   return Math.round(US_MID + pulses / 2);
 }
@@ -65,6 +68,7 @@ export function packChannels(values: readonly number[]): Uint8Array {
   let available = 0;
   let index = 0;
   for (const raw of values) {
+    requireChannel(raw);
     bits |= (raw & 0x7ff) << available;
     available += 11;
     while (available >= 8) {
@@ -77,6 +81,7 @@ export function packChannels(values: readonly number[]): Uint8Array {
 }
 
 export function unpackChannels(payload: Uint8Array): number[] {
+  if (payload.length !== 22) throw new RangeError("Expected a 22-byte channel payload");
   const channels: number[] = [];
   let bits = 0;
   let available = 0;
@@ -98,6 +103,9 @@ export function buildFrame(
   payload: Uint8Array,
   sync = CRSF_ADDRESS_MODULE,
 ): Uint8Array {
+  if (payload.length > 60) throw new RangeError("CRSF payload exceeds 60 bytes");
+  requireByte(type);
+  requireByte(sync);
   const frame = new Uint8Array(payload.length + 4);
   frame[0] = sync;
   frame[1] = payload.length + 2;
@@ -114,6 +122,7 @@ export function buildRcFrame(channels: readonly number[]): Uint8Array {
 
 /** Extended command, sync 0xC8, same bytes EdgeTX sends for the model id. */
 export function buildModelIdFrame(modelId: number): Uint8Array {
+  if (!Number.isFinite(modelId)) throw new RangeError("Model ID must be finite");
   const id = Math.max(0, Math.min(63, Math.round(modelId)));
   const body = new Uint8Array([
     CRSF_FRAMETYPE_COMMAND,
@@ -150,15 +159,29 @@ const SYNC_BYTES = new Set([
   0xec,
 ]);
 
+function requireByte(value: number): void {
+  if (!Number.isInteger(value) || value < 0 || value > 0xff) {
+    throw new RangeError("Expected an unsigned byte");
+  }
+}
+
+function requireChannel(value: number): void {
+  if (!Number.isInteger(value) || value < 0 || value > 0x7ff) {
+    throw new RangeError("Expected an unsigned 11-bit channel value");
+  }
+}
+
+/**
+ * Incremental parser with a bounded 64-byte window. A rejected candidate drops
+ * only its first byte, preserving later frames swallowed by a corrupt length.
+ * An incomplete candidate is retained until its declared length arrives: a
+ * valid frame's payload may itself contain bytes that look like another frame.
+ */
 export class CrsfParser {
   private readonly buffer = new Uint8Array(64);
-  private state: "sync" | "length" | "body" = "sync";
-  private expected = 0;
   private filled = 0;
 
   reset(): void {
-    this.state = "sync";
-    this.expected = 0;
     this.filled = 0;
   }
 
@@ -167,42 +190,37 @@ export class CrsfParser {
   }
 
   private pushByte(byte: number, onFrame: (frame: ParsedFrame) => void): void {
-    if (this.state === "sync") {
-      if (SYNC_BYTES.has(byte)) {
-        this.buffer[0] = byte;
-        this.state = "length";
+    this.buffer[this.filled++] = byte;
+    while (this.filled > 0) {
+      if (!SYNC_BYTES.has(this.buffer[0])) {
+        this.discard(1);
+        continue;
       }
-      return;
-    }
-
-    if (this.state === "length") {
-      if (byte < 2 || byte > 62) {
-        this.state = "sync";
-        if (SYNC_BYTES.has(byte)) {
-          this.buffer[0] = byte;
-          this.state = "length";
-        }
-        return;
+      if (this.filled < 2) return;
+      const length = this.buffer[1];
+      if (length < 2 || length > 62) {
+        this.discard(1);
+        continue;
       }
-      this.buffer[1] = byte;
-      this.expected = byte;
-      this.filled = 0;
-      this.state = "body";
-      return;
+      const total = length + 2;
+      if (this.filled < total) return;
+      if (crc8(this.buffer.subarray(2, total - 1)) !== this.buffer[total - 1]) {
+        this.discard(1);
+        continue;
+      }
+      const frame = {
+        sync: this.buffer[0],
+        type: this.buffer[2],
+        payload: this.buffer.slice(3, total - 1),
+      };
+      this.discard(total);
+      onFrame(frame);
     }
+  }
 
-    this.buffer[2 + this.filled] = byte;
-    this.filled += 1;
-    if (this.filled < this.expected) return;
-
-    const total = this.expected + 2;
-    const crc = crc8(this.buffer.subarray(2, total - 1));
-    const ok = crc === this.buffer[total - 1];
-    const sync = this.buffer[0] ?? 0;
-    const type = this.buffer[2] ?? 0;
-    const payload = this.buffer.slice(3, total - 1);
-    this.state = "sync";
-    if (ok) onFrame({ sync, type, payload });
+  private discard(count: number): void {
+    this.buffer.copyWithin(0, count, this.filled);
+    this.filled -= count;
   }
 }
 
@@ -307,39 +325,57 @@ function unsigned16(payload: Uint8Array, offset: number): number {
   return ((payload[offset] ?? 0) << 8) | (payload[offset + 1] ?? 0);
 }
 
-function cString(payload: Uint8Array, start: number): string {
-  let end = start;
-  while (end < payload.length && payload[end] !== 0) end += 1;
-  return new TextDecoder().decode(payload.subarray(start, end));
+function cString(payload: Uint8Array, start: number): string | null {
+  const end = payload.indexOf(0, start);
+  return end < 0 ? null : new TextDecoder().decode(payload.subarray(start, end));
 }
 
 function radiansToDegrees(raw: number): number {
   return (raw / 10000) * (180 / Math.PI);
 }
 
-/** Fold one parsed frame into telemetry. RC frames are echoes of what we send. */
+/** Fold an inbound frame into telemetry. Outbound echoes and malformed replies do not count. */
 export function noteFrame(
   state: ModuleTelemetry,
   frame: ParsedFrame,
 ): ModuleTelemetry {
-  if (frame.type === CRSF_FRAMETYPE_RC_CHANNELS) return state;
+  if (
+    frame.type === CRSF_FRAMETYPE_RC_CHANNELS ||
+    frame.type === CRSF_FRAMETYPE_DEVICE_PING ||
+    frame.type === CRSF_FRAMETYPE_COMMAND
+  ) return state;
+  const { payload } = frame;
+  if (
+    (frame.type === CRSF_FRAMETYPE_LINK_STATISTICS && payload.length < 10) ||
+    (frame.type === CRSF_FRAMETYPE_BATTERY && payload.length < 8) ||
+    (frame.type === CRSF_FRAMETYPE_ATTITUDE && payload.length < 6) ||
+    (frame.type === CRSF_FRAMETYPE_GPS && payload.length < 15) ||
+    (frame.type === CRSF_FRAMETYPE_FLIGHT_MODE && cString(payload, 0) === null)
+  ) return state;
+  if (frame.type === CRSF_FRAMETYPE_DEVICE_INFO) {
+    // Extended header: destination, origin; name + NUL; 14 bytes of metadata.
+    const end = payload.indexOf(0, 2);
+    if (
+      (payload[0] !== CRSF_ADDRESS_RADIO && payload[0] !== CRSF_ADDRESS_BROADCAST) ||
+      end < 3 || payload.length < end + 15
+    ) return state;
+  }
   const next: ModuleTelemetry = {
     ...state,
     lastType: frame.type,
     moduleFrames: state.moduleFrames + 1,
   };
-  const { payload } = frame;
-
   if (frame.type === CRSF_FRAMETYPE_LINK_STATISTICS && payload.length >= 10) {
     const power = payload[6] ?? 0;
     next.link = {
-      uplinkRssiDbm: -((payload[0] ?? 0) as number),
+      // TX-to-handset RSSI is signed dBm, unlike RX-to-flight-controller magnitudes.
+      uplinkRssiDbm: signed8(payload[0] ?? 0),
       uplinkLq: payload[2] ?? 0,
       uplinkSnr: signed8(payload[3] ?? 0),
       antenna: (payload[4] ?? 0) + 1,
       rfMode: payload[5] ?? 0,
       txPowerMw: power < TX_POWER_MW.length ? TX_POWER_MW[power] ?? null : null,
-      downlinkRssiDbm: -((payload[7] ?? 0) as number),
+      downlinkRssiDbm: signed8(payload[7] ?? 0),
       downlinkLq: payload[8] ?? 0,
       downlinkSnr: signed8(payload[9] ?? 0),
     };
@@ -359,10 +395,10 @@ export function noteFrame(
       yaw: radiansToDegrees(signed16(payload, 4)),
     };
   } else if (frame.type === CRSF_FRAMETYPE_FLIGHT_MODE) {
-    const mode = cString(payload, 0).trim();
+    const mode = cString(payload, 0)?.trim();
     next.flightMode = mode || null;
-  } else if (frame.type === CRSF_FRAMETYPE_DEVICE_INFO && payload.length > 2) {
-    const name = cString(payload, 2).trim();
+  } else if (frame.type === CRSF_FRAMETYPE_DEVICE_INFO && payload[1] === CRSF_ADDRESS_MODULE) {
+    const name = cString(payload, 2)?.trim();
     if (name) next.deviceName = name;
   } else if (frame.type === CRSF_FRAMETYPE_GPS && payload.length >= 15) {
     const lat = signed32(payload, 0) / 1e7;

@@ -18,9 +18,10 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   type Sticks,
   type SwitchPosition,
-  DEFAULT_STICKS,
   buildOutputs,
   sticksFromGamepad,
+  safeSticks,
+  safeChannels,
 } from "@/lib/controls";
 import {
   type ModuleTelemetry,
@@ -32,7 +33,10 @@ import {
   noteFrame,
   toHex,
 } from "@/lib/crsf";
-import { readControlLoop, sleep, writeControlLoop } from "@/lib/link";
+import {
+  type HandsetPort, type ControlSession, openHandsetPort,
+  startControlSession, withTimeout, SERIAL_TIMEOUT_MS, PortCleanupError,
+} from "@/lib/link";
 import {
   settingsFromSnapshot,
   subscribeSettings,
@@ -55,17 +59,11 @@ const CHANNELS = [
   ["CH8", "Switch"],
 ] as const;
 
-type Status = "closed" | "opening" | "open" | "live";
+type Status = "closed" | "opening" | "open" | "live" | "stopping" | "fault";
 
 type PortInfo = { usbVendorId?: number; usbProductId?: number };
 
-type OpenPort = {
-  open: (options: { baudRate: number }) => Promise<void>;
-  close: () => Promise<void>;
-  readable: ReadableStream<Uint8Array> | null;
-  writable: WritableStream<Uint8Array> | null;
-  getInfo?: () => PortInfo;
-};
+type OpenPort = HandsetPort & { getInfo?: () => PortInfo };
 
 const VENDORS: Record<number, string> = {
   0x10c4: "Silicon Labs",
@@ -98,7 +96,7 @@ export function Desk() {
     () => "",
   );
   const settings = useMemo(() => settingsFromSnapshot(rawSettings), [rawSettings]);
-  const { baud, hz, modelId, inverts, gamepad, armWithoutReply } = settings;
+  const { baud, hz, modelId, sendModelId, inverts, gamepad, armWithoutReply } = settings;
   const serialAvailable = useSyncExternalStore(
     () => () => {},
     () => getSerial() !== null,
@@ -108,7 +106,7 @@ export function Desk() {
   const [status, setStatus] = useState<Status>("closed");
   const [error, setError] = useState<string | null>(null);
   const [portName, setPortName] = useState("No port");
-  const [sticks, setSticks] = useState<Sticks>(DEFAULT_STICKS);
+  const [sticks, setSticks] = useState<Sticks>(() => safeSticks(inverts));
   const [switches, setSwitches] = useState<
     [SwitchPosition, SwitchPosition, SwitchPosition]
   >([0, 0, 0]);
@@ -118,7 +116,8 @@ export function Desk() {
   const [hold, setHold] = useState(0);
   const [telemetry, setTelemetry] = useState<ModuleTelemetry>(emptyTelemetry);
   const [moduleAt, setModuleAt] = useState<number | null>(null);
-  const [now, setNow] = useState(() => Date.now());
+  const [linkAt, setLinkAt] = useState<number | null>(null);
+  const [now, setNow] = useState(() => performance.now());
   const [wire, setWire] = useState({ frames: 0, bytesIn: 0, rate: 0 });
 
   const sticksRef = useRef(sticks);
@@ -127,9 +126,12 @@ export function Desk() {
   const armedRef = useRef(armed);
   const outputsRef = useRef(buildOutputs(sticks, switches, armed, inverts));
   const hzRef = useRef(hz);
-  const modelRef = useRef(modelId);
+  const modelRef = useRef<number | null>(sendModelId ? modelId : null);
+  const statusRef = useRef<Status>("closed");
+  const mountedRef = useRef(true);
+  const cleanupRef = useRef<() => void>(() => {});
+  const telemetryRef = useRef(emptyTelemetry());
   const armBlockerRef = useRef<string | null>(null);
-  const stopRef = useRef(false);
   const dragCount = useRef(0);
   const holdRaf = useRef<number | null>(null);
   const parserRef = useRef(new CrsfParser());
@@ -137,12 +139,9 @@ export function Desk() {
   const bytesInRef = useRef(0);
   const rateWindowRef = useRef(0);
   const portRef = useRef<OpenPort | null>(null);
-  const sessionRef = useRef<{
-    reader: ReadableStreamDefaultReader<Uint8Array>;
-    writer: WritableStreamDefaultWriter<Uint8Array>;
-    done: Promise<void>;
-  } | null>(null);
+  const sessionRef = useRef<ControlSession | null>(null);
   const stopPromiseRef = useRef<Promise<void> | null>(null);
+  const closePromiseRef = useRef<Promise<void> | null>(null);
 
   const outputs = useMemo(
     () => buildOutputs(sticks, switches, armed, inverts),
@@ -152,6 +151,8 @@ export function Desk() {
   const preview = useMemo(() => buildRcFrame(outputs.crsf), [outputs]);
   const throttleUs = outputs.microseconds[2] ?? 988;
   const moduleFresh = moduleAt !== null && now - moduleAt < 2500;
+  const linkFresh = status === "live" && linkAt !== null && now - linkAt < 2500;
+  const liveLink = linkFresh ? telemetry.link : null;
 
   let armBlocker: string | null = null;
   if (status !== "live") armBlocker = "Start the link before arming.";
@@ -168,14 +169,15 @@ export function Desk() {
     invertsRef.current = inverts;
     armedRef.current = armed;
     hzRef.current = hz;
-    modelRef.current = modelId;
+    modelRef.current = sendModelId ? modelId : null;
     outputsRef.current = outputs;
     armBlockerRef.current = armBlocker;
-  }, [armBlocker, armed, hz, inverts, modelId, outputs, sticks, switches]);
+  }, [armBlocker, armed, hz, inverts, modelId, sendModelId, outputs, sticks, switches]);
 
   useEffect(() => {
     if (!gamepad) return;
     let frame = 0;
+    let hadGamepad = false;
     const tick = () => {
       const pads = navigator.getGamepads?.() ?? [];
       let pad: Gamepad | null = null;
@@ -188,9 +190,14 @@ export function Desk() {
         pad ??= candidate;
       }
       setGamepadName(pad ? pad.id : null);
+      if (!pad && hadGamepad) {
+        hadGamepad = false;
+        cleanupRef.current();
+      }
       if (pad && dragCount.current === 0) {
         const next = sticksFromGamepad(pad);
         if (next) {
+          hadGamepad = true;
           setSticks((current) =>
             current.roll === next.roll &&
             current.pitch === next.pitch &&
@@ -199,8 +206,18 @@ export function Desk() {
               ? current
               : next,
           );
+        } else if (hadGamepad) {
+          hadGamepad = false;
+          cleanupRef.current();
         }
-        if (armedRef.current && pad.buttons[1]?.pressed) setArmed(false);
+        if (pad.buttons[1]?.pressed) {
+          if (holdRaf.current !== null) cancelAnimationFrame(holdRaf.current);
+          holdRaf.current = null;
+          setHold(0);
+          armedRef.current = false;
+          outputsRef.current = buildOutputs(sticksRef.current, switchesRef.current, false, invertsRef.current);
+          setArmed(false);
+        }
       }
       frame = requestAnimationFrame(tick);
     };
@@ -211,7 +228,7 @@ export function Desk() {
   useEffect(() => {
     if (status !== "live") return;
     const id = window.setInterval(() => {
-      setNow(Date.now());
+      setNow(performance.now());
       setWire({
         frames: sentRef.current,
         bytesIn: bytesInRef.current,
@@ -224,7 +241,14 @@ export function Desk() {
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") setArmed(false);
+      if (event.key === "Escape") {
+        if (holdRaf.current !== null) cancelAnimationFrame(holdRaf.current);
+        holdRaf.current = null;
+        setHold(0);
+        armedRef.current = false;
+        outputsRef.current = buildOutputs(sticksRef.current, switchesRef.current, false, invertsRef.current);
+        setArmed(false);
+      }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -240,11 +264,16 @@ export function Desk() {
   }, [status]);
 
   useEffect(() => {
+    mountedRef.current = true;
+    const onHidden = () => { if (document.hidden) cleanupRef.current(); };
+    const onPageHide = () => cleanupRef.current();
+    document.addEventListener("visibilitychange", onHidden);
+    window.addEventListener("pagehide", onPageHide);
     return () => {
-      stopRef.current = true;
-      if (holdRaf.current !== null) cancelAnimationFrame(holdRaf.current);
-      void sessionRef.current?.reader.cancel().catch(() => undefined);
-      void portRef.current?.close().catch(() => undefined);
+      mountedRef.current = false;
+      document.removeEventListener("visibilitychange", onHidden);
+      window.removeEventListener("pagehide", onPageHide);
+      cleanupRef.current();
     };
   }, []);
 
@@ -264,139 +293,161 @@ export function Desk() {
     );
   }
 
+  function changeStatus(next: Status) {
+    statusRef.current = next;
+    if (mountedRef.current) setStatus(next);
+  }
+
+  function resetControls() {
+    cancelHold();
+    const next = safeSticks(invertsRef.current);
+    sticksRef.current = next;
+    armedRef.current = false;
+    outputsRef.current = buildOutputs(next, switchesRef.current, false, invertsRef.current);
+    setSticks(next);
+    setArmed(false);
+  }
+
+  function closePort(): Promise<void> {
+    if (closePromiseRef.current) return closePromiseRef.current;
+    const port = portRef.current;
+    if (!port || (!port.readable && !port.writable)) {
+      portRef.current = null;
+      changeStatus("closed");
+      return Promise.resolve();
+    }
+    const run = (async () => {
+      try {
+        await withTimeout(port.close(), SERIAL_TIMEOUT_MS, "Port close timed out. Unplug USB before reconnecting.");
+        if (portRef.current === port) portRef.current = null;
+        changeStatus("closed");
+      } catch (caught) {
+        if (!port.readable && !port.writable) {
+          if (portRef.current === port) portRef.current = null;
+          changeStatus("closed");
+          return;
+        }
+        changeStatus("fault");
+        setError(caught instanceof Error ? caught.message : "Could not close the port. Unplug USB before reconnecting.");
+      }
+    })();
+    closePromiseRef.current = run.finally(() => { closePromiseRef.current = null; });
+    return closePromiseRef.current;
+  }
+
   function stopLoops() {
     if (stopPromiseRef.current) return stopPromiseRef.current;
-    const run = (async () => {
-      const session = sessionRef.current;
-      if (!session) return;
-      disarmOutputs();
-      await sleep(120);
-      stopRef.current = true;
-      try {
-        await session.reader.cancel();
-      } catch {
-        /* The read loop treats cancel as a stop. */
-      }
-      await session.done;
-      try {
-        session.writer.releaseLock();
-      } catch {
-        /* Already released. */
-      }
-      try {
-        session.reader.releaseLock();
-      } catch {
-        /* Cancel releases the reader. */
-      }
-      sessionRef.current = null;
-    })();
-    stopPromiseRef.current = run.finally(() => {
-      stopPromiseRef.current = null;
+    resetControls();
+    const session = sessionRef.current;
+    if (!session) return Promise.resolve();
+    changeStatus("stopping");
+    const run = session.stop().then(async (failure) => {
+      if (sessionRef.current === session) sessionRef.current = null;
+      if (failure) await closePort();
     });
+    stopPromiseRef.current = run.finally(() => { stopPromiseRef.current = null; });
     return stopPromiseRef.current;
   }
 
   async function disconnect() {
+    if (statusRef.current === "opening" || (statusRef.current === "closed" && !portRef.current)) return;
+    changeStatus("stopping");
     await stopLoops();
-    const port = portRef.current;
-    portRef.current = null;
-    if (port) {
-      try {
-        await port.close();
-      } catch {
-        /* Already closed. */
-      }
-    }
-    setStatus("closed");
+    await closePort();
     setModuleAt(null);
+    setLinkAt(null);
     setTelemetry(emptyTelemetry());
   }
 
   async function connect() {
+    if (statusRef.current !== "closed" || portRef.current) return;
     setError(null);
     const serial = getSerial();
     if (!serial) {
       setError("This browser cannot open a USB serial port. Use Chrome or Edge.");
       return;
     }
-    setStatus("opening");
+    changeStatus("opening");
     try {
       const port = await serial.requestPort();
-      await port.open({ baudRate: baud });
+      if (!mountedRef.current) return;
       portRef.current = port;
+      await openHandsetPort(port, baud);
+      if (!mountedRef.current) { await closePort(); return; }
+      resetControls();
       setPortName(portLabel(port.getInfo?.() ?? null));
-      setStatus("open");
+      changeStatus("open");
     } catch (caught) {
-      setStatus("closed");
-      if (caught instanceof DOMException && caught.name === "NotFoundError") {
-        setError(null);
-        return;
+      if (caught instanceof PortCleanupError) {
+        changeStatus("fault");
+      } else {
+        portRef.current = null;
+        changeStatus("closed");
       }
+      if (caught instanceof DOMException && caught.name === "NotFoundError") return;
       setError(caught instanceof Error ? caught.message : "Could not open the port.");
     }
   }
 
-  async function startLink() {
+  function startLink() {
     const port = portRef.current;
-    if (!port?.readable || !port.writable || status !== "open") return;
+    if (!port || statusRef.current !== "open" || sessionRef.current || stopPromiseRef.current) return;
+    changeStatus("live");
     setError(null);
-    disarmOutputs();
+    resetControls();
     parserRef.current.reset();
-    setTelemetry(emptyTelemetry());
+    telemetryRef.current = emptyTelemetry();
+    setTelemetry(telemetryRef.current);
     setModuleAt(null);
+    setLinkAt(null);
     sentRef.current = 0;
     bytesInRef.current = 0;
     rateWindowRef.current = 0;
     setWire({ frames: 0, bytesIn: 0, rate: 0 });
-    stopRef.current = false;
-
-    const reader = port.readable.getReader();
-    const writer = port.writable.getWriter();
-    const fail = (error: unknown) => {
-      if (stopRef.current) return;
-      stopRef.current = true;
-      void reader.cancel().catch(() => undefined);
-      setError(error instanceof Error ? error.message : "The serial port closed.");
-    };
-    const writeDone = writeControlLoop({
-      writer,
-      channels: () => outputsRef.current.crsf,
-      modelId: () => modelRef.current,
-      periodMs: () => 1000 / hzRef.current,
-      stopRequested: () => stopRef.current,
-      onSent: () => {
-        sentRef.current += 1;
-        rateWindowRef.current += 1;
-      },
-    }).catch((error: unknown) => {
-      fail(error);
-      throw error;
-    });
-    const readDone = readControlLoop(
-      reader,
-      (chunk) => {
-        bytesInRef.current += chunk.byteLength;
-        parserRef.current.push(chunk, (frame) => {
-          if (frame.type === 0x16) return;
-          setModuleAt(Date.now());
-          setTelemetry((current) => noteFrame(current, frame));
-        });
-      },
-      () => stopRef.current,
-    ).catch((error: unknown) => {
-      fail(error);
-      throw error;
-    });
-    const done = Promise.allSettled([writeDone, readDone]).then(() => undefined);
-    sessionRef.current = { reader, writer, done };
-    setStatus("live");
+    try {
+      const session = startControlSession({
+        port,
+        channels: () => outputsRef.current.crsf,
+        finalChannels: () => safeChannels(outputsRef.current.crsf),
+        modelId: () => modelRef.current,
+        periodMs: () => 1000 / hzRef.current,
+        onSent: () => { sentRef.current += 1; rateWindowRef.current += 1; },
+        onBytes: (chunk) => {
+          bytesInRef.current += chunk.byteLength;
+          parserRef.current.push(chunk, (frame) => {
+            const previous = telemetryRef.current;
+            const next = noteFrame(previous, frame);
+            if (next.moduleFrames === previous.moduleFrames) return;
+            telemetryRef.current = next;
+            setModuleAt(performance.now());
+            if (frame.type === 0x14) setLinkAt(performance.now());
+            setTelemetry(next);
+          });
+        },
+        onError: (error) => { resetControls(); changeStatus("stopping"); setError(error.message); },
+      });
+      sessionRef.current = session;
+      void session.done.then(async (failure) => {
+        if (sessionRef.current === session) sessionRef.current = null;
+        if (failure) await closePort();
+      });
+    } catch (caught) {
+      resetControls();
+      changeStatus("stopping");
+      setError(caught instanceof Error ? caught.message : "Could not start the serial link.");
+      void closePort();
+    }
   }
 
   async function stopLink() {
-    if (status !== "live") return;
+    if (statusRef.current !== "live") return;
     await stopLoops();
-    if (portRef.current) setStatus("open");
+    if (portRef.current && (statusRef.current as Status) === "stopping") changeStatus("open");
   }
+
+  useEffect(() => {
+    cleanupRef.current = () => { void disconnect(); };
+  });
 
   function beginHold() {
     if (armBlocker || holdRaf.current !== null) return;
@@ -410,6 +461,8 @@ export function Desk() {
       const progress = Math.min(1, (time - started) / HOLD_MS);
       setHold(progress);
       if (progress >= 1) {
+        armedRef.current = true;
+        outputsRef.current = buildOutputs(sticksRef.current, switchesRef.current, true, invertsRef.current);
         setArmed(true);
         setHold(0);
         holdRaf.current = null;
@@ -443,7 +496,9 @@ export function Desk() {
         ? "Port open"
         : status === "opening"
           ? "Choosing port"
-          : "Disconnected";
+          : status === "stopping"
+            ? "Stopping"
+            : status === "fault" ? "Port error" : "Disconnected";
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-5 px-4 py-6 sm:px-6">
@@ -598,7 +653,7 @@ export function Desk() {
                 <Button
                   type="button"
                   variant="outline"
-                  onClick={() => setSticks(DEFAULT_STICKS)}
+                  onClick={resetControls}
                 >
                   Center sticks and drop throttle
                 </Button>
@@ -618,11 +673,13 @@ export function Desk() {
                       <Switch
                         id={`invert-${key}`}
                         checked={inverts[key]}
-                        onCheckedChange={(checked) =>
-                          updateSettings({
-                            inverts: { ...inverts, [key]: checked },
-                          })
-                        }
+                        disabled={status === "live" || status === "stopping"}
+                        onCheckedChange={(checked) => {
+                          const next = { ...inverts, [key]: checked };
+                          invertsRef.current = next;
+                          resetControls();
+                          updateSettings({ inverts: next });
+                        }}
                       />
                     </div>
                   ))}
@@ -638,7 +695,11 @@ export function Desk() {
                   <Switch
                     id="gamepad"
                     checked={gamepad}
-                    onCheckedChange={(checked) => updateSettings({ gamepad: checked })}
+                    onCheckedChange={(checked) => {
+                      resetControls();
+                      if (statusRef.current === "live") void disconnect();
+                      updateSettings({ gamepad: checked });
+                    }}
                   />
                 </div>
               </CardContent>
@@ -651,7 +712,7 @@ export function Desk() {
               <CardContent className="flex flex-col gap-4">
                 <div>
                   <p className="mb-2 text-xs text-muted-foreground">
-                    Baud. 400000 is the handset rate.
+                    USB baud. Start with 115200; rates depend on the USB driver.
                   </p>
                   <div className="flex flex-wrap gap-1.5">
                     {HANDSET_BAUDS.map((rate) => (
@@ -669,6 +730,12 @@ export function Desk() {
                   </div>
                 </div>
                 <div className="flex items-center gap-3">
+                  <Switch id="send-model-id" checked={sendModelId}
+                    disabled={status === "live" || status === "stopping"}
+                    onCheckedChange={(checked) => updateSettings({ sendModelId: checked })} />
+                  <Label htmlFor="send-model-id">Set model ID on module</Label>
+                </div>
+                <div className="flex items-center gap-3">
                   <Label htmlFor="model-id" className="shrink-0">
                     Model id
                   </Label>
@@ -678,6 +745,7 @@ export function Desk() {
                     min={0}
                     max={63}
                     value={modelId}
+                    disabled={!sendModelId || status === "live" || status === "stopping"}
                     onChange={(event) => {
                       const next = Number(event.target.value);
                       if (Number.isNaN(next)) return;
@@ -735,7 +803,7 @@ export function Desk() {
                 <Button
                   type="button"
                   variant="ghost"
-                  disabled={status === "closed" || status === "opening"}
+                  disabled={status === "closed" || status === "opening" || status === "stopping"}
                   onClick={() => void disconnect()}
                 >
                   Disconnect
@@ -769,7 +837,7 @@ export function Desk() {
                       type="button"
                       variant="destructive"
                       className="mt-3 h-12 w-full text-base"
-                      onClick={() => setArmed(false)}
+                      onClick={() => { cancelHold(); disarmOutputs(); }}
                     >
                       Disarm
                     </Button>
@@ -784,6 +852,8 @@ export function Desk() {
                       }}
                       onPointerUp={cancelHold}
                       onPointerCancel={cancelHold}
+                      onLostPointerCapture={cancelHold}
+                      onBlur={cancelHold}
                       onKeyDown={(event) => {
                         if (event.repeat) return;
                         if (event.key === " " || event.key === "Enter") {
@@ -846,13 +916,16 @@ export function Desk() {
                 <CardTitle>From the module</CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
+                {linkAt !== null && !linkFresh ? (
+                  <p className="text-xs text-muted-foreground">Link statistics are stale.</p>
+                ) : null}
                 <div>
                   <p className="font-mono text-4xl tabular-nums">
-                    {telemetry.link ? `${telemetry.link.uplinkLq}%` : "—"}
+                    {liveLink ? `${liveLink.uplinkLq}%` : "—"}
                   </p>
                   <p className="text-xs text-muted-foreground">
                     Uplink quality
-                    {telemetry.link?.uplinkLq === 0
+                    {liveLink?.uplinkLq === 0
                       ? ". The module is sending, and no receiver is locked."
                       : ""}
                   </p>
@@ -861,33 +934,33 @@ export function Desk() {
                   <div>
                     <dt className="text-xs text-muted-foreground">Uplink RSSI</dt>
                     <dd className="font-mono tabular-nums">
-                      {telemetry.link ? `${telemetry.link.uplinkRssiDbm} dBm` : "—"}
+                      {liveLink ? `${liveLink.uplinkRssiDbm} dBm` : "—"}
                     </dd>
                   </div>
                   <div>
                     <dt className="text-xs text-muted-foreground">Uplink SNR</dt>
                     <dd className="font-mono tabular-nums">
-                      {telemetry.link ? `${telemetry.link.uplinkSnr} dB` : "—"}
+                      {liveLink ? `${liveLink.uplinkSnr} dB` : "—"}
                     </dd>
                   </div>
                   <div>
                     <dt className="text-xs text-muted-foreground">Downlink</dt>
                     <dd className="font-mono tabular-nums">
-                      {telemetry.link ? `${telemetry.link.downlinkLq}%` : "—"}
+                      {liveLink ? `${liveLink.downlinkLq}%` : "—"}
                     </dd>
                   </div>
                   <div>
                     <dt className="text-xs text-muted-foreground">TX power</dt>
                     <dd className="font-mono tabular-nums">
-                      {telemetry.link?.txPowerMw == null
+                      {liveLink?.txPowerMw == null
                         ? "—"
-                        : `${telemetry.link.txPowerMw} mW`}
+                        : `${liveLink.txPowerMw} mW`}
                     </dd>
                   </div>
                   <div>
                     <dt className="text-xs text-muted-foreground">Last reply</dt>
                     <dd className="font-mono tabular-nums">
-                      {moduleAt ? `${Math.max(0, now - moduleAt)} ms` : "none"}
+                      {moduleAt ? `${Math.max(0, Math.round(now - moduleAt))} ms` : "none"}
                     </dd>
                   </div>
                   <div>

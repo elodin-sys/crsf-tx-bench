@@ -1,0 +1,51 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable]
+        include:
+          - os: ubuntu-latest
+            rust: 1.83.0
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: crates/nomad
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component rustfmt --component clippy
+      - run: cargo +${{ matrix.rust }} fmt --check
+      - run: cargo +${{ matrix.rust }} test --locked --all-targets
+      - run: cargo +${{ matrix.rust }} test --locked --no-default-features
+      - run: cargo +${{ matrix.rust }} test --locked --doc
+      - run: cargo +${{ matrix.rust }} clippy --locked --all-targets -- -D warnings
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - if: runner.os == 'Linux'
+        run: cargo +${{ matrix.rust }} check --locked --all-features --all-targets
+      - if: runner.os == 'Linux'
+        run: cargo +${{ matrix.rust }} check --locked --no-default-features --features libudev --all-targets

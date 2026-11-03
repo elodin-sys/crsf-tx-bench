@@ -8,7 +8,7 @@ readme = "README.md"
 rust-version = "1.83"
 
 [dependencies]
-serialport = { version = "4.7", optional = true, default-features = false }
+serialport = { version = "4.10.1", optional = true, default-features = false }
 # serialport depends on unescaper. 0.1.9 and later require edition 2024.
 unescaper = { version = "=0.1.8", optional = true }
 
@@ -16,8 +16,11 @@ unescaper = { version = "=0.1.8", optional = true }
 default = ["serial"]
 serial = ["dep:serialport", "dep:unescaper"]
 # USB product names in `list_ports`. Needs the system libudev development files.
-libudev = ["serialport/libudev"]
+libudev = ["serial", "serialport/libudev"]
 
 [[example]]
 name = "send"
 required-features = ["serial"]
+
+[dev-dependencies]
+ctrlc = { version = "3.4", features = ["termination"] }
