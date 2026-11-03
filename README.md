@@ -56,6 +56,18 @@ Keep the tab in the foreground. Browsers slow timers in background tabs, and the
 
 Stop the link and unplug USB. A running handset keeps Wi-Fi from starting. Power-cycle from the XT30, wait for `ExpressLRS TX`, and set `serial_rx` and `serial_tx` back to 4.
 
+## Rust library
+
+[`crates/nomad`](crates/nomad) is the same USB-C handset link as a Rust crate. It builds the CRSF frames, writes them to the serial port, and reads link telemetry back.
+
+```bash
+cargo test --manifest-path crates/nomad/Cargo.toml
+cargo run --manifest-path crates/nomad/Cargo.toml --example send -- --list
+cargo run --manifest-path crates/nomad/Cargo.toml --example send -- --port /dev/ttyACM0
+```
+
+The pin change above is required. `send` transmits disarmed sticks at 100 Hz and prints uplink quality. Ctrl-C writes three disarmed frames before the port closes.
+
 ## Develop
 
 ```bash

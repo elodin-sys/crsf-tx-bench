@@ -1,0 +1,23 @@
+[package]
+name = "nomad"
+version = "0.1.0"
+edition = "2021"
+description = "CRSF handset library for a RadioMaster Nomad ExpressLRS module over USB-C"
+license = "MIT"
+readme = "README.md"
+rust-version = "1.83"
+
+[dependencies]
+serialport = { version = "4.7", optional = true, default-features = false }
+# serialport depends on unescaper. 0.1.9 and later require edition 2024.
+unescaper = { version = "=0.1.8", optional = true }
+
+[features]
+default = ["serial"]
+serial = ["dep:serialport", "dep:unescaper"]
+# USB product names in `list_ports`. Needs the system libudev development files.
+libudev = ["serialport/libudev"]
+
+[[example]]
+name = "send"
+required-features = ["serial"]
