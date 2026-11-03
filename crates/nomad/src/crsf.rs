@@ -49,10 +49,10 @@ pub const CRC8_DVB_S2: u8 = 0xd5;
 /// CRC-8 polynomial for the command sub-CRC.
 pub const CRC8_COMMAND: u8 = 0xba;
 
-/// Baud rates the ExpressLRS handset UART will lock to. 400000 is the usual one.
+/// Baud rates the ExpressLRS handset UART searches for.
 pub const HANDSET_BAUDS: [u32; 5] = [115_200, 400_000, 921_600, 1_870_000, 2_250_000];
-/// Baud a radio uses when it talks to the module.
-pub const DEFAULT_BAUD: u32 = 400_000;
+/// Nomad USB-C default, verified with its CP2102 bridge.
+pub const DEFAULT_BAUD: u32 = 115_200;
 
 const SYNC_BYTES: [u8; 4] = [CRSF_SYNC, CRSF_ADDRESS_RADIO, CRSF_ADDRESS_MODULE, 0xec];
 
@@ -123,6 +123,10 @@ pub fn pack_channels(channels: &[u16; CHANNEL_COUNT]) -> [u8; 22] {
 }
 
 /// Unpack 16 channels from a 22-byte CRSF payload.
+///
+/// This low-level helper pads missing bytes with zero and ignores trailing bytes
+/// (for example, an extended RC frame's status byte). Validate the length before
+/// using untrusted data; [`RawFrame::decode`] requires at least 22 bytes.
 #[must_use]
 pub fn unpack_channels(payload: &[u8]) -> [u16; CHANNEL_COUNT] {
     let mut channels = [0u16; CHANNEL_COUNT];
@@ -239,18 +243,15 @@ pub struct RawFrame {
     pub payload: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Phase {
-    Sync,
-    Length,
-    Body { expected: usize, filled: usize },
-}
-
-/// Incremental CRSF parser. Bad CRCs are dropped. A length byte that is itself a sync restarts the frame.
+/// Incremental CRSF parser with a bounded sliding window.
+///
+/// Invalid length/CRC candidates discard one byte, retaining any complete frame
+/// that followed the corruption. An incomplete candidate waits for its declared
+/// length (at most 64 bytes); valid frames may themselves contain sync bytes.
 #[derive(Clone, Debug)]
 pub struct Parser {
     buffer: [u8; 64],
-    phase: Phase,
+    filled: usize,
 }
 
 impl Default for Parser {
@@ -265,68 +266,60 @@ impl Parser {
     pub fn new() -> Self {
         Self {
             buffer: [0; 64],
-            phase: Phase::Sync,
+            filled: 0,
         }
     }
 
     /// Forget a partial frame.
     pub fn reset(&mut self) {
-        self.phase = Phase::Sync;
+        self.filled = 0;
     }
 
     /// Feed bytes. Complete, CRC-valid frames are returned in order.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<RawFrame> {
         let mut frames = Vec::new();
         for &byte in chunk {
-            if let Some(frame) = self.push_byte(byte) {
-                frames.push(frame);
+            // Processing always leaves fewer than 64 buffered bytes.
+            self.buffer[self.filled] = byte;
+            self.filled += 1;
+            loop {
+                if self.filled == 0 {
+                    break;
+                }
+                if !is_sync(self.buffer[0]) {
+                    self.discard(1);
+                    continue;
+                }
+                if self.filled < 2 {
+                    break;
+                }
+                let len = usize::from(self.buffer[1]);
+                if !(2..=62).contains(&len) {
+                    self.discard(1);
+                    continue;
+                }
+                let total = len + 2;
+                if self.filled < total {
+                    break;
+                }
+                if crc8(&self.buffer[2..total - 1], CRC8_DVB_S2) != self.buffer[total - 1] {
+                    self.discard(1);
+                    continue;
+                }
+                frames.push(RawFrame {
+                    sync: self.buffer[0],
+                    ty: self.buffer[2],
+                    payload: self.buffer[3..total - 1].to_vec(),
+                });
+                self.discard(total);
             }
         }
         frames
     }
 
-    fn push_byte(&mut self, byte: u8) -> Option<RawFrame> {
-        match self.phase {
-            Phase::Sync => {
-                if is_sync(byte) {
-                    self.buffer[0] = byte;
-                    self.phase = Phase::Length;
-                }
-                None
-            }
-            Phase::Length => {
-                if !(2..=62).contains(&byte) {
-                    self.phase = Phase::Sync;
-                    if is_sync(byte) {
-                        self.buffer[0] = byte;
-                        self.phase = Phase::Length;
-                    }
-                    return None;
-                }
-                self.buffer[1] = byte;
-                self.phase = Phase::Body {
-                    expected: usize::from(byte),
-                    filled: 0,
-                };
-                None
-            }
-            Phase::Body { expected, filled } => {
-                self.buffer[2 + filled] = byte;
-                let filled = filled + 1;
-                if filled < expected {
-                    self.phase = Phase::Body { expected, filled };
-                    return None;
-                }
-                let total = expected + 2;
-                let crc = crc8(&self.buffer[2..total - 1], CRC8_DVB_S2);
-                let ok = crc == self.buffer[total - 1];
-                let sync = self.buffer[0];
-                let ty = self.buffer[2];
-                let payload = self.buffer[3..total - 1].to_vec();
-                self.phase = Phase::Sync;
-                ok.then_some(RawFrame { sync, ty, payload })
-            }
-        }
+    fn discard(&mut self, count: usize) {
+        self.buffer.copy_within(count..self.filled, 0);
+        self.filled -= count;
     }
 }
 
@@ -441,5 +434,76 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         to_hex(bytes).replace(' ', "")
+    }
+    #[test]
+    fn corrupt_length_retains_a_valid_frame_inside_the_failed_candidate() {
+        let ping = build_ping_frame();
+        let mut corrupt = vec![CRSF_SYNC, 12, 0x99, 0];
+        corrupt.extend_from_slice(&ping);
+        corrupt.extend_from_slice(&[0; 4]);
+        assert_ne!(crc8(&corrupt[2..13], CRC8_DVB_S2), corrupt[13]);
+        let frames = Parser::new().push(&corrupt);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].ty, CRSF_FRAMETYPE_DEVICE_PING);
+    }
+
+    #[test]
+    fn truncated_frame_recovers_when_enough_subsequent_bytes_arrive() {
+        let rc = build_rc_frame(&[CRSF_CHANNEL_MID; 16]);
+        let mut input = rc[..7].to_vec();
+        for _ in 0..12 {
+            input.extend_from_slice(&build_ping_frame());
+        }
+        let frames = Parser::new().push(&input);
+        assert!(frames.len() >= 10);
+        assert!(frames
+            .iter()
+            .all(|frame| frame.ty == CRSF_FRAMETYPE_DEVICE_PING));
+    }
+
+    #[test]
+    fn maximum_frame_may_contain_a_complete_inner_frame_at_any_split() {
+        let mut payload = [0x55; 60];
+        payload[11..17].copy_from_slice(&build_ping_frame());
+        let bytes = build_frame(0x99, &payload, CRSF_SYNC).unwrap();
+        assert_eq!(bytes.len(), 64);
+        for split in 0..=bytes.len() {
+            let mut parser = Parser::new();
+            let mut frames = parser.push(&bytes[..split]);
+            frames.extend(parser.push(&bytes[split..]));
+            assert_eq!(frames.len(), 1, "split {split}");
+            assert_eq!(frames[0].ty, 0x99);
+            assert_eq!(frames[0].payload, payload);
+        }
+        assert!(build_frame(0x99, &[0; 61], CRSF_SYNC).is_none());
+    }
+
+    #[test]
+    fn noise_invalid_lengths_and_reset_do_not_poison_the_next_frame() {
+        let mut parser = Parser::new();
+        assert!(parser
+            .push(&[0, 0xff, CRSF_SYNC, 0, CRSF_SYNC, 63])
+            .is_empty());
+        assert!(parser.push(&build_rc_frame(&[992; 16])[..9]).is_empty());
+        parser.reset();
+        let frames = parser.push(&build_ping_frame());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].ty, CRSF_FRAMETYPE_DEVICE_PING);
+    }
+
+    #[test]
+    fn arbitrary_streams_keep_the_buffer_bounded() {
+        let mut state = 0x1234_5678u32;
+        let mut parser = Parser::new();
+        for _ in 0..10000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            parser.push(&[state as u8]);
+            assert!(parser.filled < 64);
+        }
+        // Complete any lingering candidate, then verify recovery after noise.
+        parser.push(&[0; 64]);
+        assert_eq!(parser.push(&build_ping_frame()).len(), 1);
     }
 }

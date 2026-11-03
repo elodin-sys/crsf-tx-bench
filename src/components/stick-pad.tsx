@@ -22,11 +22,13 @@ export function StickPad({
   onDragChange,
 }: StickPadProps) {
   const padRef = useRef<HTMLDivElement>(null);
+  const pointerRef = useRef<number | null>(null);
 
   function pointFromEvent(event: React.PointerEvent<HTMLDivElement>) {
     const pad = padRef.current;
     if (!pad) return;
     const rect = pad.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
     const px = (event.clientX - rect.left) / rect.width;
     const py = (event.clientY - rect.top) / rect.height;
     const nextX = Math.min(1, Math.max(-1, px * 2 - 1));
@@ -53,21 +55,32 @@ export function StickPad({
         aria-label={`${label}. ${xLabel} and ${yLabel}.`}
         className="relative aspect-square w-full max-w-[280px] cursor-grab touch-none rounded-2xl border border-border bg-black/50 active:cursor-grabbing"
         onPointerDown={(event) => {
+          if (pointerRef.current !== null || event.button !== 0) return;
+          pointerRef.current = event.pointerId;
           event.currentTarget.setPointerCapture(event.pointerId);
           onDragChange?.(true);
           pointFromEvent(event);
         }}
         onPointerMove={(event) => {
-          if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+          if (pointerRef.current !== event.pointerId || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
           pointFromEvent(event);
         }}
         onPointerUp={(event) => {
-          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-            event.currentTarget.releasePointerCapture(event.pointerId);
-          }
+          if (pointerRef.current !== event.pointerId) return;
+          pointerRef.current = null;
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
           onDragChange?.(false);
         }}
-        onPointerCancel={() => onDragChange?.(false)}
+        onPointerCancel={(event) => {
+          if (pointerRef.current !== event.pointerId) return;
+          pointerRef.current = null;
+          onDragChange?.(false);
+        }}
+        onLostPointerCapture={(event) => {
+          if (pointerRef.current !== event.pointerId) return;
+          pointerRef.current = null;
+          onDragChange?.(false);
+        }}
       >
         <div className="pointer-events-none absolute inset-[14%] rounded-full border border-dashed border-primary/35" />
         <div className="pointer-events-none absolute inset-y-[14%] left-1/2 w-px bg-border" />

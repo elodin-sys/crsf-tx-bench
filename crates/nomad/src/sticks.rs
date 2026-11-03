@@ -119,6 +119,10 @@ fn axis_us(value: f32, invert: bool) -> i32 {
 }
 
 fn throttle_us(value: f32, invert: bool) -> i32 {
+    // Invalid control input must stay low even when the axis is reversed.
+    if !value.is_finite() {
+        return US_MIN;
+    }
     let travel = if invert {
         1.0 - finite(value)
     } else {
@@ -166,5 +170,27 @@ mod tests {
         assert_eq!(us[6], 988);
         assert_eq!(us[7], 1500);
         assert_eq!(us[2], 1500);
+    }
+    #[test]
+    fn nonfinite_inputs_never_raise_throttle_even_when_inverted() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for invert in [false, true] {
+                let mut sticks = Sticks::disarmed();
+                sticks.roll = value;
+                sticks.pitch = value;
+                sticks.yaw = value;
+                sticks.throttle = value;
+                sticks.inverts = Inverts {
+                    roll: invert,
+                    pitch: invert,
+                    yaw: invert,
+                    throttle: invert,
+                };
+                let us = sticks.to_microseconds();
+                assert_eq!([us[0], us[1], us[3]], [US_MID; 3]);
+                assert_eq!(us[2], US_MIN);
+                assert_eq!(us[4], US_MIN);
+            }
+        }
     }
 }

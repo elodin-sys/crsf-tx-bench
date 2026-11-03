@@ -6,6 +6,7 @@ export type Settings = {
   baud: number;
   hz: 50 | 100 | 200;
   modelId: number;
+  sendModelId: boolean;
   inverts: Inverts;
   gamepad: boolean;
   armWithoutReply: boolean;
@@ -16,6 +17,7 @@ export const DEFAULT_SETTINGS: Settings = {
   baud: DEFAULT_BAUD,
   hz: 100,
   modelId: 0,
+  sendModelId: false,
   inverts: DEFAULT_INVERTS,
   gamepad: false,
   armWithoutReply: false,
@@ -23,25 +25,30 @@ export const DEFAULT_SETTINGS: Settings = {
 
 const STORAGE_KEY = "nomad-desk-settings";
 const listeners = new Set<() => void>();
-
-function isBaud(value: number): boolean {
-  return (HANDSET_BAUDS as readonly number[]).includes(value);
-}
+let fallbackSnapshot = "";
+let memoryOnly = false;
 
 export function settingsFromSnapshot(raw: string): Settings {
   if (!raw) return DEFAULT_SETTINGS;
   try {
-    const parsed = JSON.parse(raw) as Partial<Settings>;
-    if (parsed.v !== 1) return DEFAULT_SETTINGS;
+    const parsed = JSON.parse(raw) as Partial<Settings> | null;
+    if (!parsed || typeof parsed !== "object" || parsed.v !== 1) return DEFAULT_SETTINGS;
     const hz = parsed.hz === 50 || parsed.hz === 100 || parsed.hz === 200 ? parsed.hz : 100;
+    const validModel = typeof parsed.modelId === "number" && Number.isFinite(parsed.modelId);
     return {
       v: 1,
-      baud: parsed.baud && isBaud(parsed.baud) ? parsed.baud : DEFAULT_BAUD,
+      baud: typeof parsed.baud === "number" && (HANDSET_BAUDS as readonly number[]).includes(parsed.baud) ? parsed.baud : DEFAULT_BAUD,
       hz,
-      modelId: Math.min(63, Math.max(0, Math.round(parsed.modelId ?? 0))),
-      inverts: { ...DEFAULT_INVERTS, ...parsed.inverts },
-      gamepad: Boolean(parsed.gamepad),
-      armWithoutReply: Boolean(parsed.armWithoutReply),
+      modelId: validModel ? Math.min(63, Math.max(0, Math.round(parsed.modelId!))) : 0,
+      sendModelId: parsed.sendModelId === true && validModel,
+      inverts: {
+        roll: parsed.inverts?.roll === true,
+        pitch: parsed.inverts?.pitch === true,
+        yaw: parsed.inverts?.yaw === true,
+        throttle: parsed.inverts?.throttle === true,
+      },
+      gamepad: parsed.gamepad === true,
+      armWithoutReply: parsed.armWithoutReply === true,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -50,21 +57,30 @@ export function settingsFromSnapshot(raw: string): Settings {
 
 export function subscribeSettings(listener: () => void): () => void {
   listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
-  };
+  return () => { listeners.delete(listener); };
 }
 
 export function readSettingsSnapshot(): string {
-  return localStorage.getItem(STORAGE_KEY) ?? "";
+  if (memoryOnly) return fallbackSnapshot;
+  try {
+    return localStorage.getItem(STORAGE_KEY) ?? fallbackSnapshot;
+  } catch {
+    return fallbackSnapshot;
+  }
 }
 
 export function updateSettings(patch: Partial<Settings>): void {
-  const next: Settings = {
+  const next = settingsFromSnapshot(JSON.stringify({
     ...settingsFromSnapshot(readSettingsSnapshot()),
     ...patch,
     v: 1,
-  };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  }));
+  fallbackSnapshot = JSON.stringify(next);
+  try {
+    localStorage.setItem(STORAGE_KEY, fallbackSnapshot);
+  } catch {
+    // Private/restricted browser storage may be unavailable; keep this tab usable.
+    memoryOnly = true;
+  }
   for (const listener of listeners) listener();
 }

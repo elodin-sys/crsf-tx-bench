@@ -2,7 +2,8 @@
 //!
 //! The module has to be told that USB-C is the handset, not the telemetry port.
 //! On the ExpressLRS hardware page set `serial_rx` to 3 and `serial_tx` to 1,
-//! then open the serial device at 400000 baud, 8N1. Power the radio from the
+//! then open the serial device at 115200 baud, 8N1. `Handset::open` deasserts
+//! DTR and RTS, which otherwise can hold the ESP32 in reset. Power the radio from the
 //! XT30. USB does not feed the amplifiers.
 //!
 //! [`Sticks`] turns stick positions into the 16 CRSF channels. [`Handset`] writes
@@ -19,7 +20,7 @@
 //! let mut sticks = Sticks::disarmed();
 //! loop {
 //!     let telemetry = handset.poll(&sticks.to_crsf())?;
-//!     if let Some(link) = telemetry.link {
+//!     if let Some(link) = telemetry.link.filter(|_| telemetry.link_is_fresh(Duration::from_secs(2))) {
 //!         println!("{}% uplink", link.uplink_lq);
 //!     }
 //!     sticks.yaw = 0.2;

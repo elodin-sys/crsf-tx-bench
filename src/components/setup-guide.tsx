@@ -40,15 +40,19 @@ export function SetupGuide() {
               . Write down the current serial pins before you change anything.
             </li>
             <li>
-              Set <span className="font-medium">serial_rx</span> to 3 and{" "}
-              <span className="font-medium">serial_tx</span> to 1. Leave the
+              In <span className="font-medium">CRSF Serial Pins</span>, set RX
+              to 3 and TX to 1 (<span className="font-mono">serial_rx</span> /
+              <span className="font-mono">serial_tx</span>). Verify this section,
+              not Serial2, reads 3/1 after saving. Leave Serial2 and the
               backpack pins at 18 and 5, and do not touch the radio SPI pins
               or the power table. Save. The module reboots.
             </li>
             <li>
               On the main Wi-Fi page, confirm the binding phrase matches the
-              receiver. Packet rate and RF power live there too. This desk
-              does not change them.
+              receiver, or use the module and receiver binding controls. For
+              an RP3, use Normal link mode, the 2.4 GHz band and a compatible
+              LoRa rate such as 150 Hz. Selecting the band alone can leave an
+              incompatible DK rate selected. This desk does not change RF settings.
             </li>
           </ol>
           <div className="overflow-hidden rounded-lg border">
@@ -92,17 +96,20 @@ export function SetupGuide() {
           </CardHeader>
           <CardContent className="space-y-3 text-sm leading-relaxed">
             <p>
-              Use a data USB-C cable. On the Fly tab, choose 400000 baud and
-              press Connect Nomad. The handset port locks to 115200, 400000,
-              921600, 1.87M, 2.25M, 3.75M, or 5.25M. 400000 is the rate a radio
-              uses. 420000 is the receiver-to-flight-controller rate, and
-              460800 is the old USB telemetry rate. Neither of those will lock.
+              Use a data USB-C cable. Start with 115200 baud, the rate verified
+              on the Nomad&apos;s CP2102 USB adapter on macOS. Connect Nomad
+              releases DTR and RTS so they do not hold the module in reset.
+              Other handset rates are available for adapters that support them;
+              400000 did not work on the tested Mac. 420000 is the receiver-side
+              rate and is not a handset option.
             </p>
             <p>
               Start link sends channel packets about 100 times a second, plus
-              a model-id command and a device ping every two seconds. The
+              a device ping every two seconds. Sending a model ID is optional
+              and off by default, preserving the module&apos;s current model. The
               module may take several seconds to find the baud. When it
-              answers, the link panel fills in.
+              answers, the link panel fills in. A module reply confirms USB
+              communication; receiver RF reception is a separate check.
             </p>
             <p>
               On Linux, your user needs permission for the tty device, usually

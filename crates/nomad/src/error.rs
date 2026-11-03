@@ -26,7 +26,7 @@ impl std::error::Error for Error {
         match self {
             Error::Io(err) => Some(err),
             #[cfg(feature = "serial")]
-            Error::Serial(_) => None,
+            Error::Serial(err) => Some(err),
         }
     }
 }
